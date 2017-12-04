@@ -1,0 +1,371 @@
+---
+title: "exampleMetaprofile"
+author: |
+  | author: "J. Attig"
+date: "08/11/2017"
+output:
+  html_document:
+    code_folding: hide
+    collapsed: no
+    fig_align: center
+    fig_caption: yes
+    keep_md: yes
+    number_sections: yes
+    smooth_scroll: no
+    toc: no
+  pdf_document:
+    toc: no
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=FALSE, eval = FALSE}
+## local settings
+setwd("/Users/attigj/Documents/Jan.Crick/computational.analysis/github/MetaProfileExample")
+```
+
+
+# Conceptualisation
+
+This script gives an example for using the createMetaprofilebyGRangeOverlaps function written by F. Agostini. The function is an effective way of summarising overlapping GenomicFeatures, with the primary goal to create Metaprofiles. The example shows the positioning of Alu and LINE repeat sequences relative to the splice sites of Alu and LINE-derived exons.
+
+
+# required packages
+
+We need a few packages to run the code. Please ensure these are installed (install.packages()). If at any point R returns an error such as 
+' No documentation for ‘melt.data.table’ in specified packages and libraries:
+you could try ‘??melt.data.table’ '
+in all likelihood you are more up to date on running the respective package. In this case, identify what the new name of the function is and replace occurences in 'createMetaprofilebyGRangeOverlaps'.
+
+My versions are:
+R version 3.3.2 (2016-10-31)
+data.table 1.10.4
+rtracklayer 1.34.2
+
+
+ <!-- load packages  -->
+```{r loadPackages, message=FALSE, eval=TRUE, include=TRUE, results='hide'}
+print("Show us our current working directory (set as desired) and load packages")
+getwd()
+
+library(knitr)
+require(rtracklayer)
+require(GenomicRanges)
+require(data.table)
+require(ggplot2)
+require("RColorBrewer")
+
+hg19.seqinfo <- readRDS("seqinfo.hg19.rds")
+
+#and a function ro reduce overlapping GRanges without loosing the mcol entry
+source("../generalised-Rscripts/Reduce.overlapping.Ranges.R")
+```
+
+
+
+
+# Input data: 
+## exon coordinates
+
+The exon coordinates are from USCSC hg19, and the file is comparably small (~10,000 entries). To obtain the sizes of the chromosomes, we use the 'BSgenome.Hsapiens.UCSC.hg19'. Note the initial download of BSgenome files involves large files. 
+
+Let's look at the import of the exons as a bedgraph (more or less straight from UCSC). This is a GRange. Lots more information can be stored with it though! (compare with the .rds exon file)
+
+
+__minimal bedgraph__
+```{r exons from bedgraph, eval = TRUE, echo = FALSE, results='markup'}
+# function to import bedgraphs such as exon coordinates or iCLIP data. Be sure to check if you want to import the score of your data!
+import_bedfile <- function(file.name, genome="hg19"){
+
+   gr=import.bed(file.name,genome=genome)
+   elementMetadata(gr)$name=NULL
+   
+   #human specific but BSgenome contains many other genomes, too. No hg38 unfortunately.
+   #seqinfo objects can be easily created by hand from the fasta index(.fai) file of the respective genome ..
+
+   if(genome == "hg19"){ 
+      if(is.null(hg19.seqinfo)){
+         require(BSgenome.Hsapiens.UCSC.hg19)
+         seqlengths(gr) <- seqlengths("Hsapiens")[seqlevels(gr)] 
+         } else {
+                     seqlengths(gr) <- seqlengths(hg19.seqinfo)[seqlevels(gr)]
+         }
+   }
+
+   return(gr)
+}
+
+exons.filepath <- "./UCSCannotated.repeatderExons.bed"
+UCSCbedgraph.gr <- import_bedfile(exons.filepath)
+UCSCbedgraph.gr
+
+```
+
+
+__preprocessed Exon GRange__
+```{r exons from custom-processing of UCSC tables, eval = TRUE, echo = FALSE,  results='hold'}
+
+myExons.gr <- readRDS("UCSCannotated.repeatderExons.rds")
+myExons.gr
+
+```
+
+
+
+
+## repeats annotated by repeatMasker
+
+Repeat annotation for your favourite genome is available from RepeatMasker (or UCSC). These are large files. For the sake of demonstration, the code contains download command for the file and how to generate a GRange from it - but the download isnt executed by default). You'd do this only once and save the GRange as an R formatted file (Rdata or RDS) for future reference.
+
+
+```{r download repeats table, eval=FALSE, include= FALSE}
+
+system("wget http://repeatmasker.org/genomes/hg19/RepeatMasker-rm405-db20140131/hg19.fa.out.gz")
+system("gzip -d hg19.fa.out.gz")
+```
+
+```{r download and import repeats table, include= FALSE}
+
+repeats.dt <- fread("hg19.fa.out", fill=TRUE, skip = 3L, header=FALSE)
+
+#badly formatted table
+repeats.dt <- repeats.dt [ 3:nrow(repeats.dt), ]
+colnames(repeats.dt) <- c("swScore", "milliDiv", "milliDel", "milliIns", "seqnames", "start", "end", "geneLeft", "strand", "repName", "repFamily", "repStart", "repEnd", "repLeft", "bin")
+
+repeats.dt [, repClass := tstrsplit(repFamily, "/", keep =1) ] 
+repeats.dt [ strand == "C", strand := "-" ]
+
+```
+
+
+
+```{r modify repeat table and generate GRange, message = TRUE, echo = FALSE}
+
+### subset for Alu & LINEs
+repeatsofInterest.dt <- repeats.dt [ repClass %in% c("LINE", "SINE") , ]
+repeatsofInterest.dt <- repeatsofInterest.dt [ !grepl("tRNA", repFamily), ]   #remove tRNA dervied repeats - they'll have essentially no signal
+
+print(paste("Total number of repeat elements of interest: ", nrow(repeatsofInterest.dt), sep=""))
+print("made up of")
+table(repeats.dt$repClass)
+
+
+
+repeatsofInterest.gr <- makeGRangesFromDataFrame(repeatsofInterest.dt, 
+                                                 keep.extra.columns = FALSE)
+repeatsofInterest.gr$repFamily <- repeatsofInterest.dt$repFamily
+
+# for the sake of easy interpretation of the data, let's ignore the incomplete / heterozygous assemblies from UCSC and only use conventional chromosomes
+chrom <- paste("chr", c(1:22,"X","Y"), sep="")
+seqlevels(repeatsofInterest.gr, force=TRUE) <- chrom
+seqlengths(repeatsofInterest.gr) [ seqlevels(repeatsofInterest.gr)] <- seqlengths(hg19.seqinfo) [ seqlevels(repeatsofInterest.gr)]
+
+
+### generate GRangesList and remove overlapping entries
+repeats.grl <- split(repeatsofInterest.gr, repeatsofInterest.gr$repFamily)
+repeats.reduced.grl <- reduce(repeats.grl)
+```
+
+
+
+
+
+
+```{r flank splice sites }
+flank.size = 3000
+
+### GRanges input (currently) must have unique 'gene_id' column
+myExons.gr$gene_id <- paste("ID", 1:length(myExons.gr))
+myExons.gr$exontype <- ifelse(myExons.gr$antisenseAlu.exon, "antisenseAluExon", 
+                              ifelse(myExons.gr$LINE.exon, "LINEderExon", NA))
+
+                                 
+
+selectplusFlank.splice.site.3 <- function(gr) {
+   #remove single exon genes
+   gr <- gr [ gr$exonCount != 1 ]
+   
+   #remove first exons (no 3'SS)
+   gr <- gr [ gr$exon.number != 1 ]
+
+   #splice site position
+   mcols(gr) <- mcols(gr) [ c("gene_id", "exontype")]  #deleting the mcols here will reduce the memory usage quite drastically
+   gr$splicesiteType <- "splicesite3"
+  
+   exon3SS <- flank(gr, -1, start = TRUE)
+   
+   #remove duplicates
+   exon3SS <- rm.identical.dupl.ranges(exon3SS)
+   
+   #flank into intron
+   exon3SSflanked <- flank(exon3SS, flank.size, both=TRUE)
+
+   #resize to only have 100nt into the exon
+   exon3SSflanked <- resize(exon3SSflanked,  flank.size+101, fix='start')
+
+   return(exon3SSflanked)
+}
+
+
+selectplusFlank.splice.site.5 <- function(gr) {
+
+   #remove single exon genes
+   gr <- gr [ gr$exonCount != 1 ]
+   
+   #remove last exons (no 5'SS)
+   gr <- gr [ gr$exonCount != gr$exon.number ]
+
+   #splice site position
+   mcols(gr) <- mcols(gr) [ c("gene_id", "exontype")]  #deleting the mcols here will reduce the memory usage quite drastically
+   gr$splicesiteType <- "splicesite5"
+   exon5SS <- flank(gr, -1, start = FALSE)
+   
+   #remove duplicates
+   exon5SS <- rm.identical.dupl.ranges(exon5SS)
+   
+   #flank into intron
+   exon5SSflanked <- flank(exon5SS, flank.size, both=FALSE, start=FALSE)
+   exon5SSflanked <- resize(exon5SSflanked,  flank.size+101, fix='end')
+
+   return(exon5SSflanked)
+}
+
+
+splice.sites.flanked.3SS <- selectplusFlank.splice.site.3(myExons.gr)
+splice.sites.flanked.5SS <- selectplusFlank.splice.site.5(myExons.gr)
+```
+
+
+
+
+
+# Metaprofile using repeat-coverage and flanked splice sites as input
+
+```{r calculate overlaps}
+##### data.table profile based on RLE coverage of genomic elements 
+pos.covList <- lapply(repeats.reduced.grl, function(x) { x <- x [ strand(x) == "+"]; return(coverage(x))})
+neg.covList <- lapply(repeats.reduced.grl, function(x) { x <- x [ strand(x) == "-"]; return(coverage(x))})
+
+
+
+##### calculate densities around exons
+source("../generalised-Rscripts/createMetaprofilebyGRangeOverlaps_20171002.R")
+
+
+
+### for LINEs, we are interested in sense and antisense coverage, so we generate two profiles
+### for Alus, we know only antisense Alus seed exons (efficiently); so we only look at the antisense
+### we do the splice sites separately. 
+# This is not strictly necessary, the only difference will be the x-axis labels (from -5000 to +100 vs -100 to +5000)
+# if done together in one GRange, gene_id must still be unique and x-axis labels have to be overwritten appropriately at the end in the plot
+
+
+LINE.index <- grepl("LINE", names(pos.covList))
+senseOrientation.3SSprofile.dt =  createProfile(pos.covList [ LINE.index ], neg.covList [ LINE.index ], 
+                            splice.sites.flanked.3SS, 
+                            sizeFac=NULL, upstream=flank.size, downstream=101,
+                                             bin_width=40, min_count=1, keys=c("splicesiteType", "exontype"))
+
+senseOrientation.5SSprofile.dt =  createProfile(pos.covList [ LINE.index ], neg.covList [ LINE.index ], 
+                            splice.sites.flanked.5SS, 
+                            sizeFac=NULL, upstream=101, downstream=flank.size, 
+                                             bin_width=40, min_count=1, keys=c("splicesiteType", "exontype"))
+
+### to obtain the antisense coverage, we swap the positive and negative strand of the exon GRange (see ?invertStrand) 
+# (so minus strand repeat entries will be tested against plus strand exons )
+# if we do this, we'll need to correct the labels 
+# alternatively: swap the strands in repeatsofInterest.gr and create coverage objects separately for antisense
+
+antisenseOrientation.3SSprofile.dt =  createProfile(
+                           pos.covList, neg.covList,
+                           invertStrand(splice.sites.flanked.3SS),
+                           revLabels = TRUE,
+                           sizeFac=NULL, upstream=flank.size, downstream=101,
+                           bin_width=40, min_count=1, keys=c("splicesiteType", "exontype"))
+
+antisenseOrientation.5SSprofile.dt = createProfile(
+                           pos.covList, neg.covList,
+                           invertStrand(splice.sites.flanked.5SS),
+                           revLabels = TRUE,
+                           sizeFac=NULL, upstream=101, downstream=flank.size, 
+                           bin_width=40, min_count=1, keys=c("splicesiteType", "exontype"))
+
+```
+
+
+## process primary output of metaprofile and plot with ggplot2
+If there was any repeat family which didn't have any overlaps with the input, than they are kicket out here (for instance, the 'Jockeys')
+The numbers refer to the number of bins with an entry for each family.
+
+
+```{r combine output from createProfile, eval=TRUE, echo = FALSE}
+#first we want to combine the different repeat elements into one table, using the names to keep track of each repeats' entries
+toplot = rbindlist( list( 
+   sense = rbind(
+      rbindlist(senseOrientation.3SSprofile.dt [!unlist(lapply(senseOrientation.3SSprofile.dt, is.null))], idcol="repFamily"), 
+      rbindlist(senseOrientation.5SSprofile.dt [!unlist(lapply(senseOrientation.5SSprofile.dt, is.null))], idcol="repFamily")),
+   antisense = rbind(
+      rbindlist(antisenseOrientation.3SSprofile.dt [!unlist(lapply(antisenseOrientation.3SSprofile.dt, is.null))], idcol="repFamily"),
+      rbindlist(antisenseOrientation.5SSprofile.dt [!unlist(lapply(antisenseOrientation.5SSprofile.dt, is.null))], idcol="repFamily"))
+                          ), idcol = "orientation")
+with(toplot, table(orientation, repFamily))
+```
+
+
+
+```{r plot profiles, eval=TRUE, echo = FALSE}
+toplot [, repClass := tstrsplit(repFamily, "/", keep =2) ] 
+
+# normalise by number of splice sites
+toplot[ , `:=`(valueNorm, value/Tot)]
+
+
+
+
+#################################
+#####   generate plots    ####### 
+#################################
+
+#colors
+col.senseAntisense <- c(brewer.pal(9, "Blues")[c(7)], brewer.pal(9, "Oranges")[c(6)])
+
+ggplot(toplot, aes(x=Position, y=valueNorm, col= orientation)) +
+   ggtitle("repeat density around Alu/LINE derived exons by repFamily as annotated by RptMasker") +
+   geom_hline(yintercept = 0, color = "Darkgrey", linetype = 1 ) +
+   geom_vline(xintercept = 0, color = "Darkgrey", linetype = 2 ) +
+   facet_grid( repClass ~ exontype + splicesiteType, scales = 'free') + 
+   geom_line() + labs(y = "repeat coverage (in % of exons)") +
+   scale_colour_manual(values =  col.senseAntisense) + theme_minimal()
+
+```
+__Note the difference in the scales for Alu and LINE-repeats. Alus usually donate both 5' and 3' splice sites, while LINEs have a fair share of exons for which they only the 5' splice site__
+
+
+
+
+We also often want to table the number of repeat elements or the number of splice sites which are going into the plot
+
+__Number of 5' and 3' splice sites in this dataset__
+```{r, eval=TRUE, echo = FALSE}
+tmp = as.data.table(copy(mcols(append(splice.sites.flanked.3SS, splice.sites.flanked.5SS))))
+setkeyv(tmp, c("splicesiteType"))
+tmp = tmp[, .N, by=key(tmp)]
+
+tmp
+```
+
+
+__Number of repeat elements in each group__
+```{r, eval=TRUE, echo = FALSE}
+n.repeats <- data.frame(name = names(repeats.reduced.grl), elements = unlist(lapply(repeats.reduced.grl, length)))
+kable(n.repeats)
+```
+
+
+
+
+
+
+
